@@ -1,3 +1,4 @@
+# coding=utf-8
 ################################################################################
 #
 # Copyright (c) 2016 eBay Software Foundation.
@@ -26,7 +27,12 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+from __future__ import unicode_literals
+
 
 import data_utils
 import sse_model
 import sse_evaluator
+import sse_index
+import tokenizer
+import text_encoder

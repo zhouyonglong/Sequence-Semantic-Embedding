@@ -1,3 +1,4 @@
+# coding=utf-8
 ################################################################################
 #
 # Copyright (c) 2016 eBay Software Foundation.
@@ -32,8 +33,12 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+from __future__ import unicode_literals
 
-import random
+from builtins import map
+from builtins import range
+from builtins import object
+import codecs
 
 import numpy as np
 from six.moves import xrange
@@ -41,7 +46,8 @@ import tensorflow as tf
 
 import data_utils
 import sse_model
-
+import text_encoder
+import math
 
 class Evaluator(object):
   """
@@ -52,36 +58,38 @@ class Evaluator(object):
     evaluator = model.Evaluator(model, eval_src, srcLens, tgtIDs, tgtInputs, tgtLens, tgtID_FullLabelMap , sess, batch_size=2048)
 
   """
-  def __init__(self, model, srcSeqs, srcLens, tgtIDs, target_inputs, target_lens, tgtID_FullLableMap, session, batch_size=2048 ):
+  def __init__(self, model, eval_corpus, tgtIndexFile,  session  ):
     """
     Initializes an Evaluator.
 
-    :param model: save SSE models
-    :param srcSeqs: evaluation set source inpput tokens seq
-    :param srcLens: length of src sequences
-    :param tgtIDs:  labeld tgtIDs for each source inputs
-    :param target_inputs, target_lens: full target Space inputs sequences and their lengths
-    :param session: current tensorflow session
-    :param batch_size: batch_size to run
-
+    :param model: SSE model
+    :param eval_corpus: eval corpus contains source_tokens, source_seq_length, correct_targetIds
+    :param tgtIndexFile: encoded full targetSpace Index file. Format: targetID, targetSequence, targetEncodings
+    :param session:
+    :param batch_size:
     """
 
     self.model = model
-    self.tgtIDs = tgtIDs
-    self.tgtID_FullLableMap = tgtID_FullLableMap
-
-    #split evaluation set into batches
-    srcSeq_batches = [ srcSeqs[k:k + batch_size] for k in range(0, len(srcSeqs), batch_size) ]
-
-    srcLens_batches = [ srcLens[k:k + batch_size] for k in range(0, len(srcSeqs), batch_size) ]
-
-    tgtInput_batches = [ target_inputs for k in range(0, len(srcSeqs), batch_size)]
-
-    tgtLen_batches = [ target_lens for k in range(0, len(srcSeqs), batch_size)]
-
-    self.feed_dicts = map(model.get_predict_feed_dict, srcSeq_batches, tgtInput_batches, srcLens_batches, tgtLen_batches)
-
+    self.srcSeq_batch = [  entry[0]  for entry in  eval_corpus ]
     self.session = session
+
+    self.targetEncodings = []
+    self.targetIDs = []
+    self.idLabelMap = {}
+    idx=0
+    for line in codecs.open(tgtIndexFile, 'r', 'utf-8').readlines():
+      info = line.strip().split('\t')
+      if len(info) != 3:
+        print('Error in targetIndexFile! %s' % line)
+        continue
+      tgtid, tgtseq, tgtEncoding = info[0], info[1], info[2]
+      self.targetIDs.append(tgtid)
+      self.targetEncodings.append( [ float(f) for f in tgtEncoding.strip().split(',') ] )
+      self.idLabelMap[tgtid] = idx
+      idx += 1
+    self.eval_Labels = [ [ self.idLabelMap[tgtid] for tgtid in entry[1] ] for entry in eval_corpus ]
+
+    self.targetEncodings = np.array( self.targetEncodings )
 
 
   def eval(self, top_n=(1, 3, 10)):
@@ -92,16 +100,15 @@ class Evaluator(object):
     """
     acc = []
     self.model.set_forward_only(True)
-    pred_labels = [ self.session.run( self.model.predicted_labels, feed_dict=d)
-                                for d in self.feed_dicts ]
-
-    pred_labels = np.vstack(pred_labels)
-
-
     for n in top_n:
-      k = 0
-      for j in range(len(self.tgtIDs)):
-        if self.tgtID_FullLableMap[self.tgtIDs[j]] in pred_labels[j][:n]:
-          k += 1
-      acc.append(float(k) / len(self.tgtIDs))
+      batchSize = 600
+      batchacc = []
+      for batchId in range(math.ceil( len(self.srcSeq_batch) / batchSize )):
+        feed_dict = self.model.get_source_encoding_feed_dict(self.srcSeq_batch[batchId * batchSize: (batchId +1) * batchSize])
+        sourceEncodings = self.session.run([self.model.norm_src_seq_embedding], feed_dict=feed_dict)
+        sourceEncodings = np.vstack(sourceEncodings)
+        distances = np.dot( sourceEncodings, self.targetEncodings.T)
+        rankedScore, rankedIdx = data_utils.getSortedResults(distances)
+        batchacc.append( data_utils.computeTopK_TightVersion_accuracy(n, self.eval_Labels[batchId * batchSize: (batchId +1) * batchSize], rankedIdx))
+      acc.append(np.mean(batchacc))
     return acc

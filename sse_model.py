@@ -1,3 +1,4 @@
+# coding=utf-8
 ################################################################################
 #
 # Copyright (c) 2016 eBay Software Foundation.
@@ -70,7 +71,11 @@ target sequence are similar and can be shared.
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+from __future__ import unicode_literals
 
+from builtins import zip
+from builtins import range
+from builtins import object
 import random
 
 import numpy as np
@@ -78,21 +83,19 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
 import data_utils
+from tensorflow.contrib.rnn import stack_bidirectional_rnn
+
 
 
 class SSEModel(object):
 
   # Number of target sequences returned by prediction operation
 
-  def __init__(self, MAX_SEQ_LENGTH, max_gradient_norm, src_vocab_size, tgt_vocab_size, word_embed_size, seq_embed_size,
-               src_cell_size, tgt_cell_size, num_layers,
-               learning_rate, learning_rate_decay_factor, targetSpaceSize, network_mode='source-encoder-only', forward_only=False, TOP_N=20, name="SSEModel" ):
-
+  def __init__(self, modelParams ):
 
     """ Create the Sequence Semantic Embedding Model.
 
-    :param src_vocab_size: source data vocab size
-    :param tgt_vocab_size:  target data vocab size
+    :param vocab_size:  data vocab size. Note both source and target sequence share same vocabulary
     :param word_embed_size: dim for token level word embedding
     :param seq_embed_size:  dim for sequence level embedding
     :param src_cell_size:  source model RNN cell size
@@ -106,32 +109,25 @@ class SSEModel(object):
     # List of operations to be called after each training step, see
     # _add_post_train_ops
     self._post_train_ops = []
-    self.name = name
-    self.forward_only = forward_only
-    self.network_mode = network_mode.strip()
-
-    #default setup
-    self.TOP_N = TOP_N
-
-    #setup class parameters
-    self.MAX_SEQ_LENGTH = MAX_SEQ_LENGTH
-    self.max_gradient_norm = max_gradient_norm
-    self.src_vocab_size = src_vocab_size
-    self.tgt_vocab_size = tgt_vocab_size
-    self.word_embed_size = word_embed_size
-    self.seq_embed_size = seq_embed_size
-    self.src_cell_size = src_cell_size
-    self.tgt_cell_size = tgt_cell_size
-    self.num_layers = num_layers
-    self.learning_rate = tf.Variable(float(learning_rate), name='learning_rate', trainable=False)
-    self.learning_rate_decay_op = self.learning_rate.assign(self.learning_rate * learning_rate_decay_factor)
+    self.name = 'SSEmodel'
+    self.forward_only = bool(modelParams['forward_only'])
+    self.network_mode = modelParams['network_mode']
+    self.TOP_N = int(modelParams['predict_nbest'])
+    self.MAX_SEQ_LENGTH = int(modelParams['max_seq_length'])
+    self.max_gradient_norm = 5.0
+    self.vocab_size = int(modelParams['vocab_size'])
+    self.word_embed_size = int(modelParams['embedding_size'])
+    self.seq_embed_size = int(modelParams['encoding_size'])
+    self.src_cell_size = int(modelParams['src_cell_size'])
+    self.tgt_cell_size = int(modelParams['tgt_cell_size'])
+    self.learning_rate = tf.Variable(float(modelParams['learning_rate']), name='learning_rate', trainable=False)
+    self.learning_rate_decay_op = self.learning_rate.assign( tf.maximum( self.learning_rate * float(modelParams['learning_rate_decay_factor']), 1e-3) )
     self.global_step = tf.Variable(0, name="global_step", trainable=False)
-    self.targetSpaceSize = targetSpaceSize
+    self.targetSpaceSize = int(modelParams['targetSpaceSize'])
 
 
     # setup basic model cell type to be LSTM or GRU or CNN
     # TODO: enhence for CNN basic unit later
-    self.use_lstm = True
 
     # Setup Source internal RNN Cell in tensoflow graph
     self._create_embedders()
@@ -139,7 +135,7 @@ class SSEModel(object):
     self._def_optimize()
     self._def_predict()
 
-    self.saver = tf.train.Saver(tf.all_variables() , max_to_keep=20)
+    self.saver = tf.train.Saver(  tf.global_variables()  , max_to_keep=20)
 
   @staticmethod
   def _last_relevant(output, length):
@@ -156,20 +152,16 @@ class SSEModel(object):
     #placeholder for input data
     self._src_input_data = tf.placeholder(tf.int32, [None, self.MAX_SEQ_LENGTH], name='source_sequence')
     self._tgt_input_data = tf.placeholder(tf.int32, [None, self.MAX_SEQ_LENGTH], name='target_sequence')
-    self._labels = tf.placeholder(tf.int64, [None], name='targetSpace_labels')
-    self._src_lens = tf.placeholder(tf.int32, [None], name='source_seq_lenths')
-    self._tgt_lens = tf.placeholder(tf.int32, [None], name='target_seq_lenths')
+    self._labels = tf.placeholder(tf.float32, [None], name='targetSpace_labels')
 
     #create word embedding vectors
-    self.src_word_embedding = tf.get_variable('src_word_embedding', [self.src_vocab_size, self.word_embed_size],
+    # note: both source and target sequence share same vocabulary and word embeddings
+    self.word_embedding = tf.get_variable('word_embedding', [self.vocab_size, self.word_embed_size],
                                          initializer=tf.random_uniform_initializer(-0.25,0.25))
 
-    self.tgt_word_embedding = tf.get_variable('tgt_word_embedding', [self.tgt_vocab_size, self.word_embed_size],
-                                         initializer=tf.random_uniform_initializer(-0.25, 0.25))
-
     #transform input tensors from tokenID to word embedding
-    self.src_input_distributed = tf.nn.embedding_lookup( self.src_word_embedding, self._src_input_data, name='dist_source')
-    self.tgt_input_distributed = tf.nn.embedding_lookup( self.tgt_word_embedding, self._tgt_input_data, name='dist_target')
+    self.src_input_distributed = tf.nn.embedding_lookup( self.word_embedding, self._src_input_data, name='dist_source')
+    self.tgt_input_distributed = tf.nn.embedding_lookup( self.word_embedding, self._tgt_input_data, name='dist_target')
 
 
     if self.network_mode == 'source-encoder-only':
@@ -219,8 +211,7 @@ class SSEModel(object):
         self.src_seq_embedding = tf.matmul(self.pool_flat, self.src_M)
 
     with tf.variable_scope('target_embedding'):
-      self.tgt_seq_embedding = tf.get_variable('tgt_seq_embedding', shape=[self.targetSpaceSize, self.seq_embed_size],
-                                               initializer=tf.random_uniform_initializer(-0.25, 0.25))
+      self.tgt_seq_embedding = tf.get_variable('tgt_seq_embedding', shape=[self.targetSpaceSize, self.seq_embed_size], initializer=tf.random_uniform_initializer(-0.25, 0.25))
 
 
   def _source_encoder_only_network(self):
@@ -228,69 +219,39 @@ class SSEModel(object):
     # Build source encoder
     with tf.variable_scope('source_only_encoder'):
       # TODO: need play with forgetGate and peeholes here
-      if self.use_lstm:
-        src_single_cell = tf.nn.rnn_cell.LSTMCell(self.src_cell_size, forget_bias=1.0, use_peepholes=False)
-      else:
-        src_single_cell = tf.nn.rnn_cell.GRUCell(self.src_cell_size)
-      src_cell = src_single_cell
-      if self.num_layers > 1:
-        src_cell = tf.nn.rnn_cell.MultiRNNCell([src_single_cell] * self.num_layers)
+      src_cell = tf.contrib.rnn.BasicLSTMCell(num_units=self.src_cell_size)
+      src_output, _ = tf.contrib.rnn.static_rnn(src_cell, tf.unstack(self.src_input_distributed, axis=1), dtype=tf.float32)
+      src_last_output = src_output[-1]
 
-      src_output, _ = tf.nn.dynamic_rnn(src_cell, self.src_input_distributed, sequence_length=self._src_lens,
-                                        dtype=tf.float32)
-      src_last_output = self._last_relevant(src_output, self._src_lens)
       self.src_M = tf.get_variable('src_M', shape=[self.src_cell_size, self.seq_embed_size],
                                    initializer=tf.truncated_normal_initializer())
-      # self.src_b = tf.get_variable('src_b', shape=[self.seq_embed_size])
-      self.src_seq_embedding = tf.matmul(src_last_output, self.src_M)  # + self.src_b
+      self.src_seq_embedding = tf.matmul(src_last_output, self.src_M)
 
     # Build target encoder
     with tf.variable_scope('target_embedding'):
       # no need train target model, just train embedding directly
-      self.tgt_seq_embedding = tf.get_variable('tgt_seq_embedding', shape=[self.targetSpaceSize, self.seq_embed_size],
-                                                 initializer=tf.random_uniform_initializer(-0.25, 0.25))
-
+      self.tgt_seq_embedding = tf.get_variable('tgt_seq_embedding', shape=[self.targetSpaceSize, self.seq_embed_size], initializer=tf.random_uniform_initializer(-0.25, 0.25))
 
 
   def _dual_encoder_network(self):
     # config SSE network to be dual encoder mode
     # Build source encoder
     with tf.variable_scope('source_encoder'):
-      # TODO: need play with forgetGate and peeholes here
-      if self.use_lstm:
-        src_single_cell = tf.nn.rnn_cell.LSTMCell(self.src_cell_size, forget_bias=1.0, use_peepholes=False)
-      else:
-        src_single_cell = tf.nn.rnn_cell.GRUCell(self.src_cell_size)
-      src_cell = src_single_cell
-      if self.num_layers > 1:
-        src_cell = tf.nn.rnn_cell.MultiRNNCell([src_single_cell] * self.num_layers)
-
-      src_output, _ = tf.nn.dynamic_rnn(src_cell, self.src_input_distributed, sequence_length=self._src_lens,
-                                        dtype=tf.float32)
-      src_last_output = self._last_relevant(src_output, self._src_lens)
+      src_cell = tf.contrib.rnn.BasicLSTMCell(num_units=self.src_cell_size)
+      src_output, _ = tf.contrib.rnn.static_rnn(src_cell, tf.unstack(self.src_input_distributed, axis=1), dtype=tf.float32)
+      src_last_output = src_output[-1]
       self.src_M = tf.get_variable('src_M', shape=[self.src_cell_size, self.seq_embed_size],
                                    initializer=tf.truncated_normal_initializer())
-      # self.src_b = tf.get_variable('src_b', shape=[self.seq_embed_size])
-      self.src_seq_embedding = tf.matmul(src_last_output, self.src_M)  # + self.src_b
-
+      self.src_seq_embedding = tf.matmul(src_last_output, self.src_M)
     # Build target encoder
     with tf.variable_scope('target_encoder'):
-      # need train target model
-      # TODO: need play with forgetGate and peeholes here
-      tgt_single_cell = tf.nn.rnn_cell.GRUCell(self.tgt_cell_size)
-      if self.use_lstm:
-        tgt_single_cell = tf.nn.rnn_cell.LSTMCell(self.tgt_cell_size, forget_bias=1.0, use_peepholes=False)
-      tgt_cell = tgt_single_cell
-      if self.num_layers > 1:
-        tgt_cell = tf.nn.rnn_cell.MultiRNNCell([tgt_single_cell] * self.num_layers)
+      tgt_cell = tf.contrib.rnn.BasicLSTMCell(num_units=self.tgt_cell_size)
+      tgt_output, _ = tf.contrib.rnn.static_rnn(tgt_cell, tf.unstack(self.tgt_input_distributed, axis=1), dtype=tf.float32)
+      tgt_last_output = tgt_output[-1]
 
-      tgt_output, _ = tf.nn.dynamic_rnn(tgt_cell, self.tgt_input_distributed, sequence_length=self._tgt_lens,
-                                        dtype=tf.float32)
-      tgt_last_output = self._last_relevant(tgt_output, self._tgt_lens)
       self.tgt_M = tf.get_variable('tgt_M', shape=[self.tgt_cell_size, self.seq_embed_size],
                                    initializer=tf.truncated_normal_initializer())
-      # self.tgt_b = tf.get_variable('tgt_b', shape=[self.seq_embed_size])
-      self.tgt_seq_embedding = tf.matmul(tgt_last_output, self.tgt_M)  # + self.tgt_b
+      self.tgt_seq_embedding = tf.matmul(tgt_last_output, self.tgt_M)
 
 
 
@@ -298,57 +259,79 @@ class SSEModel(object):
     # config SSE network to be shared encoder mode
     # Build shared encoder
     with tf.variable_scope('shared_encoder'):
-      # TODO: need play with forgetGate and peeholes here
-      if self.use_lstm:
-        src_single_cell = tf.nn.rnn_cell.LSTMCell(self.src_cell_size, forget_bias=1.0, use_peepholes=False)
-      else:
-        src_single_cell = tf.nn.rnn_cell.GRUCell(self.src_cell_size)
-
-      src_cell = src_single_cell
-      if self.num_layers > 1:
-        src_cell = tf.nn.rnn_cell.MultiRNNCell([src_single_cell] * self.num_layers)
-
-      #compute source sequence related tensors
-      src_output, _ = tf.nn.dynamic_rnn(src_cell, self.src_input_distributed, sequence_length=self._src_lens,
-                                        dtype=tf.float32)
-      src_last_output = self._last_relevant(src_output, self._src_lens)
+      src_cell = tf.contrib.rnn.BasicLSTMCell(num_units=self.src_cell_size)
+      src_output, _ = tf.contrib.rnn.static_rnn(src_cell, tf.unstack(self.src_input_distributed, axis=1), dtype=tf.float32)
+      src_last_output = src_output[-1]
       self.src_M = tf.get_variable('src_M', shape=[self.src_cell_size, self.seq_embed_size],
                                    initializer=tf.truncated_normal_initializer())
-      # self.src_b = tf.get_variable('src_b', shape=[self.seq_embed_size])
-      self.src_seq_embedding = tf.matmul(src_last_output, self.src_M)  # + self.src_b
-
+      self.src_seq_embedding = tf.matmul(src_last_output, self.src_M)
       #declare tgt_M tensor before reuse them
       self.tgt_M = tf.get_variable('tgt_M', shape=[self.src_cell_size, self.seq_embed_size],
                                    initializer=tf.truncated_normal_initializer())
-      # self.tgt_b = tf.get_variable('tgt_b', shape=[self.seq_embed_size])
 
     with tf.variable_scope('shared_encoder', reuse=True):
-      #compute target sequence related tensors by reusing shared_encoder model
-      tgt_output, _ = tf.nn.dynamic_rnn(src_cell, self.tgt_input_distributed, sequence_length=self._tgt_lens,
-                                        dtype=tf.float32)
-      tgt_last_output = self._last_relevant(tgt_output, self._tgt_lens)
-
-      self.tgt_seq_embedding = tf.matmul(tgt_last_output, self.tgt_M)  # + self.tgt_b
+      tgt_output, _ = tf.contrib.rnn.static_rnn(src_cell, tf.unstack(self.tgt_input_distributed, axis=1), dtype=tf.float32)
+      tgt_last_output = tgt_output[-1]
+      self.tgt_seq_embedding = tf.matmul(tgt_last_output, self.tgt_M)
 
 
 
   def _def_loss(self):
     # compute src / tgt similarity
     with tf.variable_scope('similarity'):
-      self.similarity = tf.matmul( self.src_seq_embedding, self.tgt_seq_embedding, transpose_b=True)
-      # self.norm_similarity = tf.matmul( tf.nn.l2_normalize(self.src_seq_embedding, 1),
-      #                                   tf.nn.l2_normalize( self.tgt_seq_embedding, 1), transpose_b=True)
+      self.norm_src_seq_embedding =  tf.nn.l2_normalize(self.src_seq_embedding, dim=-1)
+      self.norm_tgt_seq_embedding =  tf.nn.l2_normalize(self.tgt_seq_embedding, dim=-1)
+
+      # this similarity tensor is used for prediction, tensor shape is (src_batch_size * target_space_size )
+      self.similarity = tf.matmul( self.norm_src_seq_embedding, self.norm_tgt_seq_embedding, transpose_b=True)
+      #self.similarity = tf.Print(self.similarity, [self.similarity], summarize=571, message='similarity')
+
+      # this binary logit tensor is used for training, tensor shape is (src_batch_size * 1)
+      self.binarylogit =  tf.reduce_sum( tf.multiply(self.norm_src_seq_embedding, self.norm_tgt_seq_embedding) , axis=-1 )
+      #self.binarylogit = tf.Print(self.binarylogit, [self.binarylogit], summarize=6, message='binarylogit')
+
 
     with tf.variable_scope('training_loss'):
-      # # doing sampled softmax loss at here:
-      # bias = tf.get_variable('loss_bias', shape=[self.targetSpaceSize], initializer=tf.truncated_normal_initializer() )
-      # self.loss = tf.reduce_mean( tf.nn.sampled_softmax_loss( self.tgt_seq_embedding, bias, self.src_seq_embedding, \
-      #         tf.expand_dims( self._labels, 1 ), self.neg_sample_size, self.targetSpaceSize) )
+      #TODO: try logistic Binary cross entropy loss function later: tf.nn.sigmoid_cross_entropy_with_logits(logits, targets, name=None)
 
-      #doing full target space softmax loss at here
-      self.loss = tf.reduce_mean( tf.nn.sparse_softmax_cross_entropy_with_logits( self.similarity, self._labels) )
+      # weighted loss, to treat pos/neg loss with different weight
+      self.loss = tf.reduce_mean( tf.nn.weighted_cross_entropy_with_logits( logits= tf.multiply(64.0, self.binarylogit) , targets= self._labels, pos_weight= 1.0 ) )
+      # self.loss = tf.Print(self.loss, [self.loss], summarize=6, message='loss')
 
-      #TODO: try sigmoid loss function later: tf.nn.sigmoid_cross_entropy_with_logits(logits, targets, name=None)
+      #compute the binary training accuracy
+      self.train_acc = tf.reduce_mean(tf.multiply(self._labels, tf.floor(tf.sigmoid( 64.0 * self.binarylogit) + 0.1) ))   +  tf.reduce_mean(tf.multiply(1.0 - self._labels, tf.floor(1.1 - tf.sigmoid( 64.0 * self.binarylogit))) )
+
+      ########## Testing with Siamese loss with margin ############
+    # with tf.variable_scope('training_loss'):
+    #   # siamese loss with margin
+    #   margin = 0.25
+    #   # Calculate the positive losses
+    #   pos_loss_term = 0.25 * tf.square(tf.subtract(1., self.binarylogit))
+    #   pos_mult = tf.cast(self._labels, tf.float32)
+    #   positive_loss = tf.multiply(pos_mult, pos_loss_term)
+    #   # Calculate negative losses, then make sure on dissimilar strings
+    #   neg_mult = tf.subtract(1., tf.cast(self._labels, tf.float32))
+    #   negative_loss = neg_mult * tf.square(self.binarylogit)
+    #   # Combine positive and negative losses
+    #   loss = tf.add(positive_loss, negative_loss)
+    #   # Create the margin term.  This is when the targets are 0.,
+    #   #  and the scores are less than m, return 0.
+    #   # Check if target is zero (dissimilar strings)
+    #   target_zero = tf.equal(tf.cast(self._labels, tf.float32), 0.)
+    #   # Check if cosine outputs is smaller than margin
+    #   less_than_margin = tf.less(self.binarylogit, margin)
+    #   # Check if both are true
+    #   both_logical = tf.logical_and(target_zero, less_than_margin)
+    #   both_logical = tf.cast(both_logical, tf.float32)
+    #   # If both are true, then multiply by (1-1)=0.
+    #   multiplicative_factor = tf.cast(1. - both_logical, tf.float32)
+    #   total_loss = tf.multiply(loss, multiplicative_factor)
+    #   # Average loss over batch
+    #   self.loss = tf.reduce_mean(total_loss)
+    #   #compute the binary training accuracy
+    #   self.train_acc = tf.reduce_mean(tf.multiply(self._labels, tf.floor(tf.sigmoid(self.binarylogit) + 0.2) ))   +  tf.reduce_mean(tf.multiply(1 - self._labels, tf.floor(1.2 - tf.sigmoid(self.binarylogit))) )
+
+
 
   def set_top_n(self, top_n):
     self.TOP_N = top_n
@@ -356,6 +339,7 @@ class SSEModel(object):
 
   def set_forward_only(self, forward_only=True):
     self.forward_only = forward_only
+
 
   def _def_predict(self):
     # Prediction cannot return more candidates than there are categories
@@ -365,23 +349,18 @@ class SSEModel(object):
       #normalize conf score
       self.predicted_tgts_score = tf.nn.l2_normalize(self.predicted_tgts_score, 1)
       #self.predicted_tgts_score, self.predicted_labels = tf.nn.top_k(self.norm_similarity, self.TOP_N, sorted=True)
+      # self.predictResults = self.similarity
 
 
   def _def_optimize(self):
     """
     Builds graph to minimize loss function.
     """
-
-    #optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
     optimizer = tf.train.AdagradOptimizer(self.learning_rate)
 
     tvars = tf.trainable_variables()
     grads, _ = tf.clip_by_global_norm(tf.gradients(self.loss, tvars), self.max_gradient_norm )
-    self.train = optimizer.apply_gradients( zip(grads, tvars), global_step=self.global_step)  #tutorial version??
-
-    # #TODO: try different optimizer to see if any improvements
-    # self.train = optimizer.minimize(self.loss, global_step=self.global_step, gate_gradients=optimizer.GATE_NONE) #default version?
-
+    self.train = optimizer.apply_gradients( list(zip(grads, tvars)), global_step=self.global_step)
     self._add_post_train_ops()
 
 
@@ -415,39 +394,11 @@ class SSEModel(object):
      * loss (moving average)
 
     """
-    loss = tf.scalar_summary("loss (raw)", self.loss)
-    return tf.merge_summary([loss])
+    loss = tf.summary.scalar("loss (raw)", self.loss)
+    return tf.summary.merge([loss])
 
 
-  def get_train_batch(self, train_set, batch_size, tgtID_FullLabelMap):
-
-    """
-    :param train_set: tuples of positive trainpair in format of ([source_tokens, target_tokens, src_len, tgt_len, tgtID])
-    :param batch_size: postive samples in each batch
-    :param MAX_SEQ_LEN: max seq length for each input data.
-    :param tgtID_FullLabelMap:  full targetSpace tgtID to label mapping
-    :return: a tuple of batched mixed  samples in format of:
-        (source_inputs, labels, src_length)
-        source_inputs: [batch_size , MAX_SEQ_LEN]
-        labels: [batch_size ] : integar ranged from [0, num_of_tgt_classes
-        src_length: [batch_size ]
-    """
-
-    # Get a random batch of positive training pairs from train_set,
-    # and then generate labels ( classes labeled from [0, num_target_space)
-
-    source_inputs, labels, src_lens = [], [], []
-    for idx in xrange(batch_size):
-      #add a postive pair to batch
-      source_input,  src_len,  tgtID = random.choice(train_set)
-      source_inputs.append( source_input )
-      labels.append( tgtID_FullLabelMap[tgtID] )
-      src_lens.append( src_len )
-
-    return  np.array(source_inputs, dtype=np.int32), np.array(labels, dtype=np.int64), np.array(src_lens, dtype=np.int32)
-
-
-  def get_predict_feed_dict(self, srcSeqs, tgtSeqs, src_lens, tgt_lens ):
+  def get_predict_feed_dict(self, srcSeqs, tgtSeqs ):
     """
     Returns a batch feed dict for given srcSequences passed as
     [batch_size, srcSequenceTokenIds].
@@ -456,20 +407,36 @@ class SSEModel(object):
     d = {}
     d[self._src_input_data] = np.array(srcSeqs, dtype=np.int32)
     d[self._tgt_input_data] = np.array(tgtSeqs, dtype=np.int32)
-    d[self._src_lens] = np.array(src_lens, dtype=np.int32)
-    d[self._tgt_lens] = np.array(tgt_lens, dtype=np.int32)
     return d
 
 
-  def get_train_feed_dict(self, srcSeqs, tgtSeqs, labels, src_lens, tgt_lens):
+  def get_train_feed_dict(self, srcSeqs, tgtSeqs, labels):
     """
     Returns a batch feed dict for given srcSquence and tgtSequences.
 
     """
     d = {}
     d[self._src_input_data] = np.array(srcSeqs, dtype=np.int32)
-    d[self._labels] = np.array(labels, dtype=np.int64)
+    d[self._labels] = np.array(labels, dtype=np.float32)
     d[self._tgt_input_data] = np.array(tgtSeqs, dtype=np.int32)
-    d[self._src_lens] = np.array(src_lens, dtype=np.int32)
-    d[self._tgt_lens] = np.array(tgt_lens, dtype=np.int32)
     return d
+
+  def get_source_encoding_feed_dict(self, srcSeqs):
+    """
+    Returns a batch feed dict for given srcSquences.
+
+    """
+    d = {}
+    d[self._src_input_data] = np.array(srcSeqs, dtype=np.int32)
+    return d
+
+  def get_target_encoding_feed_dict(self, tgtSeqs):
+    """
+    Returns a batch feed dict for given tgtSequences.
+
+    """
+    d = {}
+    d[self._tgt_input_data] = np.array(tgtSeqs, dtype=np.int32)
+    return d
+
+
